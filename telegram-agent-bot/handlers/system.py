@@ -25,7 +25,7 @@ from core.security import check_auth, sanitize_project_path
 from core import task_registry
 from .topics import resolve_project_context, get_bound_project
 
-def _chat_scope(update: Update) -> tuple[int, int | None]:
+def chat_scope(update: Update) -> tuple[int, int | None]:
     """Returns the (chat_id, thread_id) scope key used to track this chat's active task."""
     chat_id = update.effective_chat.id if update.effective_chat else 0
     thread_id = update.effective_message.message_thread_id if update.effective_message else None
@@ -57,6 +57,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/note <Title> | <Content>` — Quick note into Obsidian vault\n"
         "• `/models` — Check LiteLLM AI Gateway provider status\n"
         "• `/status` — Server CPU/RAM, disk & tmux sessions\n"
+        "• `/selftest` — Full health check: gateway, disk, version, providers\n"
+        "• `/selfheal` — Diagnose problems & get the exact fix command\n"
+        "• `/update` — Check how far behind the latest version you are\n"
         "• `/help` — Full handbook & Telegram Forum Topics guide"
     )
     await update.effective_message.reply_text(welcome_text, parse_mode="Markdown")
@@ -94,7 +97,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "6️⃣ *Obsidian Second-Brain Sync:*\n"
         "   • Syncthing (Port 8384) syncs notes from your laptop/phone to `/data/obsidian`.\n"
         "   • `/note Design Doc | System architecture requirements`\n"
-        "   • `/vault` — Inspect recent notes & specs available to AI agents."
+        "   • `/vault` — Inspect recent notes & specs available to AI agents.\n\n"
+        "7️⃣ *Housekeeping (check-and-report, never auto-applies):*\n"
+        "   • `/selftest` — Uptime/RAM/disk, LiteLLM reachability, deployed version, active task, configured providers\n"
+        "   • `/selfheal` — Same checks, but only lists what's actually wrong plus the exact SSH command to fix it\n"
+        "   • `/update` — How many commits behind `develop` you are, with the commit list"
     )
     keyboard = [
         [
@@ -116,10 +123,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Provides real-time system metrics, uptime, disk space, and active tmux sessions."""
-    if not await check_auth(update):
-        return
+def gather_status() -> dict:
+    """Collects uptime/RAM/disk/tmux metrics. Shared by /status and /selftest so
+    there's exactly one place that knows how to read /proc/meminfo etc."""
     try:
         tmux_out = subprocess.check_output(  # nosec B603,B607
             [TMUX_BIN, "list-sessions"],
@@ -136,6 +142,14 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uptime_out = "N/A"
         df_out = "N/A"
 
+    disk_pct = None
+    try:
+        # df's "Use%" column, e.g. "...  42% /data/workspace" -> 42
+        pct_field = next(f for f in df_out.split() if f.endswith("%"))
+        disk_pct = int(pct_field.rstrip("%"))
+    except Exception:
+        pass
+
     try:
         meminfo = {}
         with open("/proc/meminfo", "r", encoding="utf-8") as f:
@@ -145,17 +159,30 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_mb = meminfo["MemTotal"] // 1024
         avail_mb = meminfo.get("MemAvailable", meminfo["MemTotal"]) // 1024
         used_mb = max(0, total_mb - avail_mb)
-        pct = round((used_mb / total_mb) * 100) if total_mb else 0
-        ram_out = f"{used_mb} MB used of {total_mb} MB ({pct}%)"
+        ram_pct = round((used_mb / total_mb) * 100) if total_mb else 0
+        ram_out = f"{used_mb} MB used of {total_mb} MB ({ram_pct}%)"
     except Exception:
         ram_out = "N/A"
 
+    return {
+        "uptime": uptime_out,
+        "ram": ram_out,
+        "disk": df_out,
+        "disk_pct": disk_pct,
+        "tmux": tmux_out,
+    }
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Provides real-time system metrics, uptime, disk space, and active tmux sessions."""
+    if not await check_auth(update):
+        return
+    s = gather_status()
     report = (
         f"🖥️ *OMV Server Status*\n\n"
-        f"⏱️ *Uptime:* `{uptime_out}`\n"
-        f"🧠 *RAM:* `{ram_out}`\n"
-        f"💾 *Disk Space:* `{df_out}`\n\n"
-        f"🧵 *Active Agent Sessions:*\n```\n{tmux_out}\n```"
+        f"⏱️ *Uptime:* `{s['uptime']}`\n"
+        f"🧠 *RAM:* `{s['ram']}`\n"
+        f"💾 *Disk Space:* `{s['disk']}`\n\n"
+        f"🧵 *Active Agent Sessions:*\n```\n{s['tmux']}\n```"
     )
     await update.effective_message.reply_text(report, parse_mode="Markdown")
 
@@ -174,7 +201,7 @@ async def exec_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    chat_id, thread_id = _chat_scope(update)
+    chat_id, thread_id = chat_scope(update)
     if task_registry.get(chat_id, thread_id):
         await update.effective_message.reply_text(
             "⚠️ Another task is already running here. Use `/cancel` to stop it first.",
@@ -234,7 +261,7 @@ async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    chat_id, thread_id = _chat_scope(update)
+    chat_id, thread_id = chat_scope(update)
     if task_registry.get(chat_id, thread_id):
         await update.effective_message.reply_text(
             "⚠️ Another task is already running here. Use `/cancel` to stop it first.",
@@ -354,7 +381,7 @@ async def claude_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    chat_id, thread_id = _chat_scope(update)
+    chat_id, thread_id = chat_scope(update)
     if task_registry.get(chat_id, thread_id):
         await update.effective_message.reply_text(
             "⚠️ Another task is already running here. Use `/cancel` to stop it first.",
@@ -410,7 +437,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update):
         return
 
-    chat_id, thread_id = _chat_scope(update)
+    chat_id, thread_id = chat_scope(update)
     label = await task_registry.cancel(chat_id, thread_id)
 
     if label is None:

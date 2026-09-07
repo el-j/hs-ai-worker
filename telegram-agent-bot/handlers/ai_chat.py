@@ -3,13 +3,79 @@ AI Chat, Model Querying, and LiteLLM Gateway Telemetry Handlers.
 Routes prompts through LiteLLM proxy with fallback chains and interactive dashboards.
 """
 
+import subprocess  # nosec B404
+
 import httpx
 from telegram import Update, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-from core.config import LITELLM_BASE, LITELLM_KEY, logger
+from core.config import LITELLM_BASE, LITELLM_KEY, WORKSPACE, GIT_BIN, logger
 from core.security import check_auth
 from core.git_auth import ai_client
 from core.ai_service import get_modelhelp_markdown
+from .topics import get_bound_project
+
+_BASE_SYSTEM_PROMPT = (
+    "You are the OpenMediaVault AI Assistant running on a self-hosted server. "
+    "Provide concise, practical, and highly accurate answers with bash/python examples when appropriate."
+)
+
+
+def _build_project_context_blurb(project_dir) -> str:
+    """Best-effort static snapshot of a bound project (README head, latest
+    commit, top-level file listing) so /chat can answer "what is this repo"
+    questions instead of claiming it has no access at all. Never raises --
+    any failure just means no context gets added, /chat still works."""
+    try:
+        parts = [f"Project: {project_dir.name}"]
+        readme = next(
+            (project_dir / n for n in ("README.md", "readme.md", "Readme.md") if (project_dir / n).is_file()),
+            None,
+        )
+        if readme:
+            parts.append(f"README (truncated):\n{readme.read_text(encoding='utf-8', errors='replace')[:1000]}")
+        try:
+            log = subprocess.check_output(  # nosec B603,B607
+                [GIT_BIN, "-C", str(project_dir), "log", "-1", "--oneline"],
+                text=True, stderr=subprocess.DEVNULL,
+            ).strip()
+            if log:
+                parts.append(f"Latest commit: {log}")
+        except Exception:
+            pass
+        entries = sorted(p.name for p in project_dir.iterdir() if not p.name.startswith("."))[:30]
+        if entries:
+            parts.append("Top-level files: " + ", ".join(entries))
+        return "\n\n".join(parts)[:1500]
+    except Exception:
+        return ""
+
+
+def _system_prompt_for(update: Update) -> str:
+    """The base system prompt, plus a static context snapshot when this
+    chat/topic is bound to a project (see /bind) -- this is what makes
+    "what is this repo about" work in a bound topic instead of the assistant
+    claiming it has no external access at all."""
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    thread_id = update.effective_message.message_thread_id if update.effective_message else None
+    bound_project = get_bound_project(chat_id, thread_id)
+    if not bound_project:
+        return _BASE_SYSTEM_PROMPT
+
+    project_dir = WORKSPACE / bound_project
+    if not project_dir.is_dir():
+        return _BASE_SYSTEM_PROMPT
+
+    blurb = _build_project_context_blurb(project_dir)
+    if not blurb:
+        return _BASE_SYSTEM_PROMPT
+
+    return (
+        f"{_BASE_SYSTEM_PROMPT}\n\n"
+        "This chat is bound to a project. Below is a static snapshot of it "
+        "(not live file access -- for anything needing current file contents "
+        "or edits, tell the user to use /task or /exec instead):\n\n" + blurb
+    )
+
 
 async def chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Queries AI model with support for custom model flags or smart routers."""
@@ -46,13 +112,7 @@ async def chat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await ai_client.chat.completions.create(
             model=selected_model,
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are the OpenMediaVault AI Assistant running on a self-hosted server. "
-                        "Provide concise, practical, and highly accurate answers with bash/python examples when appropriate."
-                    )
-                },
+                {"role": "system", "content": _system_prompt_for(update)},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2,

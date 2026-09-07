@@ -84,6 +84,8 @@ services:
       - BITBUCKET_APP_PASSWORD=${BITBUCKET_APP_PASSWORD:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - STACK_REPO_PATH=${STACK_REPO_PATH:-/stack}
+      - GITHUB_REPO_SLUG=${GITHUB_REPO_SLUG:-el-j/omv-agent-station}
     volumes:
       - ./telegram-agent-bot:/app:ro
       - ./litellm/config.yaml:/litellm/config.yaml:ro
@@ -94,6 +96,11 @@ services:
       - ${DATA_DIR:-/srv/dev-data}/ssh:/root/.ssh:ro
       - ./ssh:/root/.ssh:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Read-only view of the deployed stack checkout itself, so /selftest,
+      # /selfheal and /update can report the running commit/branch and how far
+      # behind origin it is (via the GitHub compare API) without ever needing
+      # write access to pull or rebuild anything from inside the container.
+      - ${STACK_DIR:-/srv/dev-data/omv-agent-station}:/stack:ro
 
   # ============================================================================
   # 4. Sandboxed AI Agent Workspace & Web Terminal
