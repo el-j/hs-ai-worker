@@ -28,6 +28,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 ROOT_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
@@ -242,7 +243,7 @@ class TelegramHandlerTestCase(unittest.TestCase):
         # WORKSPACE and friends are `from core.config import ...`-ed into each
         # handler module at import time, so every consumer needs its own
         # binding repointed at the temp dirs.
-        for mod in (self.git_ops, self.topics, self.callbacks):
+        for mod in (self.git_ops, self.topics, self.callbacks, self.ai_chat):
             mod.WORKSPACE = self.workspace
         self.vault.OBSIDIAN_VAULT = self.obsidian
         self.topics.TOPICS_FILE = self.workspace / ".agent_topics.json"
@@ -857,6 +858,42 @@ class TestTelegramAiChat(TelegramHandlerTestCase):
         self.arun(self.ai_chat.chat_cmd(update, context))
         self.assertTrue(any("connection reset" in e for e in update.all_edits()))
 
+    def test_chat_cmd_includes_bound_project_context_in_system_prompt(self):
+        """Regression coverage: a topic bound via /bind used to get zero repo
+        context in /chat -- the assistant would claim it had no access at all
+        even though the workspace README/commit were sitting right there."""
+        self.make_repo("myproj")
+        self.topics.set_bound_project(1, 5, "myproj")
+        client = FakeAIClient(answer="ok")
+        self.patch(self.ai_chat, "ai_client", client)
+        update = DummyUpdate(thread_id=5)
+        context = DummyContext(args=["what", "is", "this", "repo"])
+        self.arun(self.ai_chat.chat_cmd(update, context))
+        system_content = client.last_kwargs["messages"][0]["content"]
+        self.assertIn("myproj", system_content)
+        self.assertIn("hello", system_content)  # make_repo()'s README.md content
+        self.assertIn("/task", system_content)  # points to real access for deeper questions
+
+    def test_chat_cmd_unbound_chat_gets_plain_system_prompt(self):
+        client = FakeAIClient(answer="ok")
+        self.patch(self.ai_chat, "ai_client", client)
+        update, context = DummyUpdate(), DummyContext(args=["hi"])
+        self.arun(self.ai_chat.chat_cmd(update, context))
+        system_content = client.last_kwargs["messages"][0]["content"]
+        self.assertNotIn("bound to a project", system_content)
+
+    def test_chat_cmd_bound_to_nonexistent_project_gets_plain_system_prompt(self):
+        """The binding metadata can outlive the actual folder (e.g. manually
+        removed from disk) -- must fall back cleanly, never raise."""
+        self.topics.set_bound_project(1, 5, "ghost-project")
+        client = FakeAIClient(answer="ok")
+        self.patch(self.ai_chat, "ai_client", client)
+        update = DummyUpdate(thread_id=5)
+        context = DummyContext(args=["hi"])
+        self.arun(self.ai_chat.chat_cmd(update, context))
+        system_content = client.last_kwargs["messages"][0]["content"]
+        self.assertNotIn("bound to a project", system_content)
+
     def test_gemini_cmd_routes_to_gemini_model(self):
         client = FakeAIClient(answer="ok")
         self.patch(self.ai_chat, "ai_client", client)
@@ -907,6 +944,194 @@ class TestTelegramAiChat(TelegramHandlerTestCase):
         update, context = DummyUpdate(), DummyContext()
         self.arun(self.ai_chat.models_cmd(update, context))
         self.assertTrue(any("gateway unreachable" in e for e in update.all_edits()))
+
+
+class TestTelegramMaintenance(TelegramHandlerTestCase):
+    """/selftest, /selfheal, /update -- deliberately check-and-report only,
+    see handlers/maintenance.py's module docstring for why. Every test here
+    that touches _check_git_freshness/_check_litellm mocks them directly
+    (rather than faking two different httpx responses behind one client)
+    since selftest/selfheal/update are pure composition over those two
+    already-tested primitives."""
+
+    def setUp(self):
+        super().setUp()
+        import handlers.maintenance as maintenance
+        self.maintenance = maintenance
+
+    # -- _read_deployed_commit / _check_git_freshness ------------------------
+
+    def test_read_deployed_commit_reports_missing_checkout(self):
+        self.patch(self.maintenance, "STACK_REPO", self.tmp / "no-such-repo")
+        result = self.maintenance._read_deployed_commit()
+        self.assertFalse(result["ok"])
+        self.assertIn("not a git checkout", result["error"])
+
+    def test_read_deployed_commit_reads_real_repo(self):
+        repo = self.make_repo("stack")
+        self.patch(self.maintenance, "STACK_REPO", repo)
+        result = self.maintenance._read_deployed_commit()
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["sha"]), 40)
+        self.assertEqual(result["branch"], "main")
+
+    def test_check_git_freshness_reports_commits_behind(self):
+        repo = self.make_repo("stack")
+        self.patch(self.maintenance, "STACK_REPO", repo)
+        payload = {"ahead_by": 3, "commits": [{"commit": {"message": f"commit {i}\n\nbody"}} for i in range(3)]}
+        self.patch(self.maintenance, "httpx", FakeHttpx(FakeAsyncClient(FakeResponse(200, payload))))
+        result = self.arun(self.maintenance._check_git_freshness())
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["behind_by"], 3)
+        self.assertEqual(result["commits"], ["commit 0", "commit 1", "commit 2"])
+
+    def test_check_git_freshness_handles_api_failure(self):
+        repo = self.make_repo("stack")
+        self.patch(self.maintenance, "STACK_REPO", repo)
+        self.patch(self.maintenance, "httpx", FakeHttpx(FakeAsyncClient(error=RuntimeError("network down"))))
+        result = self.arun(self.maintenance._check_git_freshness())
+        self.assertFalse(result["ok"])
+
+    def test_check_git_freshness_handles_non_200_response(self):
+        repo = self.make_repo("stack")
+        self.patch(self.maintenance, "STACK_REPO", repo)
+        self.patch(self.maintenance, "httpx", FakeHttpx(FakeAsyncClient(FakeResponse(404, {}))))
+        result = self.arun(self.maintenance._check_git_freshness())
+        self.assertFalse(result["ok"])
+
+    def test_check_git_freshness_passes_through_missing_checkout(self):
+        self.patch(self.maintenance, "STACK_REPO", self.tmp / "nope")
+        result = self.arun(self.maintenance._check_git_freshness())
+        self.assertFalse(result["ok"])
+
+    # -- _check_litellm -------------------------------------------------
+
+    def test_check_litellm_true_when_reachable(self):
+        self.patch(self.maintenance, "httpx", FakeHttpx(FakeAsyncClient(FakeResponse(200, {}))))
+        self.assertTrue(self.arun(self.maintenance._check_litellm()))
+
+    def test_check_litellm_false_when_unreachable(self):
+        self.patch(self.maintenance, "httpx", FakeHttpx(FakeAsyncClient(error=RuntimeError("refused"))))
+        self.assertFalse(self.arun(self.maintenance._check_litellm()))
+
+    # -- selftest_cmd -----------------------------------------------------
+
+    def test_selftest_reports_healthy_snapshot(self):
+        self.patch(self.maintenance, "_check_litellm", AsyncMock(return_value=True))
+        self.patch(self.maintenance, "_check_git_freshness", AsyncMock(return_value={
+            "ok": True, "branch": "develop", "sha": "a" * 40, "behind_by": 0, "commits": [],
+        }))
+        update, context = DummyUpdate(), DummyContext()
+        self.arun(self.maintenance.selftest_cmd(update, context))
+        body = update.replies()[0]
+        self.assertIn("reachable", body)
+        self.assertIn("up to date", body)
+
+    def test_selftest_reports_unreachable_gateway_and_behind_version(self):
+        self.patch(self.maintenance, "_check_litellm", AsyncMock(return_value=False))
+        self.patch(self.maintenance, "_check_git_freshness", AsyncMock(return_value={
+            "ok": True, "branch": "develop", "sha": "b" * 40, "behind_by": 5, "commits": ["x"] * 5,
+        }))
+        update, context = DummyUpdate(), DummyContext()
+        self.arun(self.maintenance.selftest_cmd(update, context))
+        body = update.replies()[0]
+        self.assertIn("unreachable", body)
+        self.assertIn("5 commit(s) behind", body)
+
+    def test_selftest_lists_configured_providers_by_presence_only(self):
+        self.patch(self.maintenance, "_check_litellm", AsyncMock(return_value=True))
+        self.patch(self.maintenance, "_check_git_freshness", AsyncMock(return_value={
+            "ok": True, "branch": "develop", "sha": "a" * 40, "behind_by": 0, "commits": [],
+        }))
+        old_env = dict(os.environ)
+        os.environ["GEMINI_API_KEY"] = "super-secret-value"
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        try:
+            update, context = DummyUpdate(), DummyContext()
+            self.arun(self.maintenance.selftest_cmd(update, context))
+            body = update.replies()[0]
+            self.assertIn("Gemini", body)
+            self.assertNotIn("super-secret-value", body)
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    # -- selfheal_cmd -----------------------------------------------------
+
+    def test_selfheal_reports_nothing_to_heal_when_healthy(self):
+        self.patch(self.maintenance, "_check_litellm", AsyncMock(return_value=True))
+        self.patch(self.maintenance, "_check_git_freshness", AsyncMock(return_value={
+            "ok": True, "branch": "develop", "sha": "a" * 40, "behind_by": 0, "commits": [],
+        }))
+        update, context = DummyUpdate(), DummyContext()
+        self.arun(self.maintenance.selfheal_cmd(update, context))
+        self.assertTrue(any("Nothing to heal" in r for r in update.replies()))
+
+    def test_selfheal_lists_unreachable_gateway_with_fix_command(self):
+        self.patch(self.maintenance, "_check_litellm", AsyncMock(return_value=False))
+        self.patch(self.maintenance, "_check_git_freshness", AsyncMock(return_value={
+            "ok": True, "branch": "develop", "sha": "a" * 40, "behind_by": 0, "commits": [],
+        }))
+        update, context = DummyUpdate(), DummyContext()
+        self.arun(self.maintenance.selfheal_cmd(update, context))
+        body = update.replies()[0]
+        self.assertIn("LiteLLM gateway unreachable", body)
+        self.assertIn("docker compose restart litellm", body)
+
+    def test_selfheal_flags_high_disk_usage_with_fix_command(self):
+        self.patch(self.maintenance, "_check_litellm", AsyncMock(return_value=True))
+        self.patch(self.maintenance, "_check_git_freshness", AsyncMock(return_value={
+            "ok": True, "branch": "develop", "sha": "a" * 40, "behind_by": 0, "commits": [],
+        }))
+        self.patch(self.maintenance, "gather_status", lambda: {
+            "uptime": "1 day", "ram": "1GB", "disk": "92% /data", "disk_pct": 92, "tmux": "none",
+        })
+        update, context = DummyUpdate(), DummyContext()
+        self.arun(self.maintenance.selfheal_cmd(update, context))
+        body = update.replies()[0]
+        self.assertIn("92% full", body)
+        self.assertIn("docker system prune", body)
+
+    def test_selfheal_flags_commits_behind_with_fix_command(self):
+        self.patch(self.maintenance, "_check_litellm", AsyncMock(return_value=True))
+        self.patch(self.maintenance, "_check_git_freshness", AsyncMock(return_value={
+            "ok": True, "branch": "develop", "sha": "a" * 40, "behind_by": 4, "commits": ["a", "b", "c", "d"],
+        }))
+        update, context = DummyUpdate(), DummyContext()
+        self.arun(self.maintenance.selfheal_cmd(update, context))
+        body = update.replies()[0]
+        self.assertIn("4 commit(s) behind", body)
+        self.assertIn("git pull", body)
+
+    # -- update_cmd ---------------------------------------------------------
+
+    def test_update_cmd_reports_up_to_date(self):
+        self.patch(self.maintenance, "_check_git_freshness", AsyncMock(return_value={
+            "ok": True, "branch": "develop", "sha": "c" * 40, "behind_by": 0, "commits": [],
+        }))
+        update, context = DummyUpdate(), DummyContext()
+        self.arun(self.maintenance.update_cmd(update, context))
+        self.assertTrue(any("up to date" in r for r in update.replies()))
+
+    def test_update_cmd_lists_commits_behind(self):
+        self.patch(self.maintenance, "_check_git_freshness", AsyncMock(return_value={
+            "ok": True, "branch": "develop", "sha": "d" * 40, "behind_by": 2,
+            "commits": ["fix: bug", "feat: thing"],
+        }))
+        update, context = DummyUpdate(), DummyContext()
+        self.arun(self.maintenance.update_cmd(update, context))
+        body = update.replies()[0]
+        self.assertIn("2", body)
+        self.assertIn("fix: bug", body)
+        self.assertIn("git pull", body)
+
+    def test_update_cmd_reports_check_failure(self):
+        self.patch(self.maintenance, "_check_git_freshness", AsyncMock(return_value={
+            "ok": False, "error": "no network",
+        }))
+        update, context = DummyUpdate(), DummyContext()
+        self.arun(self.maintenance.update_cmd(update, context))
+        self.assertTrue(any("Could not check for updates" in r for r in update.replies()))
 
 
 class TestTelegramInteractive(TelegramHandlerTestCase):
