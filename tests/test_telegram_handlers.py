@@ -1448,6 +1448,37 @@ class TestTelegramTopics(TelegramHandlerTestCase):
         self.assertTrue(any("Could not create topic" in r for r in update.replies()))
 
 
+class TestTelegramCommandMenu(TelegramHandlerTestCase):
+    """ui/command_menu.py's BotCommand list is hand-maintained separately
+    from bot.py's CommandHandler registrations -- a command can work when
+    typed but silently vanish from Telegram's autocomplete menu if someone
+    forgets to add it here too (as /selftest, /selfheal, /update briefly
+    did while developing them)."""
+
+    def setUp(self):
+        super().setUp()
+        import ui.command_menu as command_menu
+        self.command_menu = command_menu
+
+    def test_new_housekeeping_commands_are_in_the_autocomplete_menu(self):
+        # telegram.BotCommand is a bare MagicMock in this test environment
+        # (tests/stubs.py) -- swap in a real tuple-producing stand-in so the
+        # resulting command names/descriptions can actually be inspected.
+        self.patch(self.command_menu, "BotCommand", lambda name, desc: (name, desc))
+
+        class DummyBotForMenu:
+            def __init__(self):
+                self.set_commands = []
+
+            async def set_my_commands(self, commands):
+                self.set_commands = commands
+
+        bot = DummyBotForMenu()
+        self.arun(self.command_menu.sync_bot_commands(bot))
+        names = {name for name, desc in bot.set_commands}
+        self.assertTrue({"selftest", "selfheal", "update"}.issubset(names))
+
+
 class TestTelegramAuthorizationGate(TelegramHandlerTestCase):
     """Every handler funnels through check_auth first -- if that gate ever stops
     firing, an unauthorized user gets a full shell on the workspace."""
