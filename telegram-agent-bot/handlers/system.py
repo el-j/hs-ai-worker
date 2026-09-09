@@ -289,7 +289,7 @@ async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     existing = None if fresh else get_task_session(chat_id, thread_id)
     resume = bool(existing and existing.get("project") == project_name)
-    if resume:
+    if resume and existing is not None:
         session_id, task_branch = existing["session_id"], existing["branch"]
     else:
         if fresh:

@@ -111,7 +111,7 @@ async def task(sender: str, args: list[str]):
 
     existing = None if fresh else get_task_session(sender, None)
     resume = bool(existing and existing.get("project") == proj)
-    if resume:
+    if resume and existing is not None:
         session_id, task_branch = existing["session_id"], existing["branch"]
     else:
         if fresh:

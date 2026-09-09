@@ -124,7 +124,7 @@ async def task_cmd(ctx: commands.Context, *, args_str: str = ""):
     # history, instead of starting over from a blank slate every single time.
     existing = None if fresh else get_task_session(*scope)
     resume = bool(existing and existing.get("project") == proj)
-    if resume:
+    if resume and existing is not None:
         session_id, task_branch = existing["session_id"], existing["branch"]
     else:
         if fresh:
