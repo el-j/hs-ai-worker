@@ -347,9 +347,15 @@ async def run_agent_task(chat_id: int, thread_id: int | None, status_msg, projec
         if resume:
             cmd.append("--restore-chat-history")
 
-        agent_auth_file = Path("/root/.anthropic/token")
-        if agent_auth_file.exists():
-            cmd.extend(["--anthropic-api-key", agent_auth_file.read_text().strip()])
+        try:
+            agent_auth_file = Path("/root/.anthropic/token")
+            if agent_auth_file.exists():
+                cmd.extend(["--anthropic-api-key", agent_auth_file.read_text().strip()])
+        except OSError:
+            # Path.exists() can raise (not just return False) when /root
+            # itself isn't readable by the current user -- optional auth,
+            # never worth failing the whole task over.
+            pass
 
         proc = await asyncio.create_subprocess_exec(  # nosec B603,B607
             *cmd,
