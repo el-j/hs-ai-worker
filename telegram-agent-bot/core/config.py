@@ -48,6 +48,7 @@ AIDER_BIN = os.environ.get("AIDER_BIN", "aider")
 TOPICS_FILE = WORKSPACE / ".agent_topics.json"
 CUSTOM_CMDS_FILE = WORKSPACE / ".custom_commands.json"
 OBSIDIAN_CMDS_FILE = OBSIDIAN_VAULT / "Config" / "commands.json"
+TASK_SESSIONS_FILE = WORKSPACE / ".agent_task_sessions.json"
 
 # Set of Built-in Commands Reserved by System
 BUILTIN_COMMANDS = {
