@@ -16,6 +16,9 @@ from agent_station_core import (
     run_claude_cli,
     run_shell_exec,
     get_system_status,
+    get_task_session,
+    set_task_session,
+    clear_task_session,
 )
 from core.security import check_auth, channel_scope, resolve_ctx_project
 
@@ -97,9 +100,12 @@ async def task_cmd(ctx: commands.Context, *, args_str: str = ""):
         return
 
     raw_parts = args_str.split()
+    fresh = raw_parts and raw_parts[0] == "--new"
+    if fresh:
+        raw_parts = raw_parts[1:]
     proj, remaining = resolve_ctx_project(ctx, raw_parts)
     if not proj or not remaining:
-        await ctx.reply("Usage: `/task [project-name] <coding instructions>`")
+        await ctx.reply("Usage: `/task [project-name] <coding instructions>` (or `/task --new ...` to abandon the current session and start over)")
         return
 
     instructions = " ".join(remaining)
@@ -113,22 +119,39 @@ async def task_cmd(ctx: commands.Context, *, args_str: str = ""):
         await ctx.reply("⚠️ Another task is already running in this channel. Use `/cancel` to stop it first.")
         return
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    session_id = f"task_{timestamp}"
-    task_branch = f"agent/{session_id}"
+    # Resume the last /task session in this channel/thread if it was on the
+    # same project and --new wasn't given -- same branch, same aider chat
+    # history, instead of starting over from a blank slate every single time.
+    existing = None if fresh else get_task_session(*scope)
+    resume = bool(existing and existing.get("project") == proj)
+    if resume and existing is not None:
+        session_id, task_branch = existing["session_id"], existing["branch"]
+    else:
+        if fresh:
+            clear_task_session(*scope)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_id = f"task_{timestamp}"
+        task_branch = f"agent/{session_id}"
 
-    msg = await ctx.reply(f"🚀 **Launching Autonomous Agent Task** for `{proj}` on `{task_branch}`...")
-    t = asyncio.create_task(run_task_background(scope, msg, proj, p_dir, instructions, session_id, task_branch))
+    if resume:
+        msg = await ctx.reply(f"🔄 **Continuing Session** for `{proj}` on `{task_branch}`...")
+    else:
+        msg = await ctx.reply(f"🚀 **Launching Autonomous Agent Task** for `{proj}` on `{task_branch}`...")
+    t = asyncio.create_task(run_task_background(scope, msg, proj, p_dir, instructions, session_id, task_branch, resume))
     task_registry.start(*scope, label=f"task: {instructions}", asyncio_task=t)
 
 
-async def run_task_background(scope, msg, proj, p_dir, instructions, session_id, task_branch):
+async def run_task_background(scope, msg, proj, p_dir, instructions, session_id, task_branch, resume=False):
     """Runs the autonomous agent in the background so /cancel can stop it mid-flight."""
     try:
         res = await run_autonomous_task(
-            p_dir, instructions, session_id, task_branch,
+            p_dir, instructions, session_id, task_branch, resume=resume,
             on_proc=lambda proc: task_registry.attach_proc(*scope, proc=proc),
         )
+        # Recorded regardless of success/failure -- the branch and aider's
+        # chat history both still exist after a failed attempt and are worth
+        # continuing from, rather than silently losing session continuity.
+        set_task_session(*scope, project=proj, session_id=session_id, branch=task_branch)
         if res["success"]:
             summary = res["summary"]
             if len(summary) > 1800:
@@ -137,6 +160,7 @@ async def run_task_background(scope, msg, proj, p_dir, instructions, session_id,
         else:
             await msg.edit(content=f"❌ Task execution error: {res.get('error')}")
     except asyncio.CancelledError:
+        set_task_session(*scope, project=proj, session_id=session_id, branch=task_branch)
         await msg.edit(content=f"🛑 **Task Cancelled** (`{proj}`, branch `{task_branch}`)")
         raise
     finally:

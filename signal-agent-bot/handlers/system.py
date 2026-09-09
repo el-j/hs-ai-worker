@@ -15,6 +15,9 @@ from agent_station_core import (
     run_shell_exec,
     get_system_status,
     resolve_project_context_raw,
+    get_task_session,
+    set_task_session,
+    clear_task_session,
 )
 from core.messaging import send_signal_message
 
@@ -83,13 +86,18 @@ async def status(sender: str, args: list[str]):
 
 
 async def task(sender: str, args: list[str]):
-    """Dispatches the autonomous coding agent on a fresh agent/<timestamp> branch."""
+    """Dispatches the autonomous coding agent, resuming the last session for
+    this sender+project if one exists (see task_sessions.py), or starting
+    fresh on a new agent/<timestamp> branch otherwise."""
     if not args:
-        await send_signal_message(sender, "Usage: /task [project-name] <coding instructions>")
+        await send_signal_message(sender, "Usage: /task [project-name] <coding instructions> (or /task --new ... to abandon the current session)")
         return
+    fresh = args[0] == "--new"
+    if fresh:
+        args = args[1:]
     proj, remaining = resolve_project_context_raw(sender, None, args, WORKSPACE)
     if not proj or not remaining:
-        await send_signal_message(sender, "Usage: /task [project-name] <coding instructions>")
+        await send_signal_message(sender, "Usage: /task [project-name] <coding instructions> (or /task --new ... to abandon the current session)")
         return
     instructions = " ".join(remaining)
     p_dir = sanitize_project_path(WORKSPACE, proj)
@@ -101,28 +109,40 @@ async def task(sender: str, args: list[str]):
         await send_signal_message(sender, "⚠️ Another task is already running for you. Send /cancel to stop it first.")
         return
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    session_id = f"task_{timestamp}"
-    task_branch = f"agent/{session_id}"
+    existing = None if fresh else get_task_session(sender, None)
+    resume = bool(existing and existing.get("project") == proj)
+    if resume and existing is not None:
+        session_id, task_branch = existing["session_id"], existing["branch"]
+    else:
+        if fresh:
+            clear_task_session(sender, None)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_id = f"task_{timestamp}"
+        task_branch = f"agent/{session_id}"
 
-    await send_signal_message(sender, f"🚀 Launching Autonomous Agent Task for {proj} on {task_branch}...")
-    t = asyncio.create_task(run_task_background(sender, proj, p_dir, instructions, session_id, task_branch))
+    if resume:
+        await send_signal_message(sender, f"🔄 Continuing Session for {proj} on {task_branch}...")
+    else:
+        await send_signal_message(sender, f"🚀 Launching Autonomous Agent Task for {proj} on {task_branch}...")
+    t = asyncio.create_task(run_task_background(sender, proj, p_dir, instructions, session_id, task_branch, resume))
     task_registry.start(sender, label=f"task: {instructions}", asyncio_task=t)
 
 
-async def run_task_background(sender, proj, p_dir, instructions, session_id, task_branch):
+async def run_task_background(sender, proj, p_dir, instructions, session_id, task_branch, resume=False):
     """Runs the autonomous agent in the background so /cancel can stop it and
     a second /task from the same sender can't race it on the same git dir."""
     try:
         res = await run_autonomous_task(
-            p_dir, instructions, session_id, task_branch,
+            p_dir, instructions, session_id, task_branch, resume=resume,
             on_proc=lambda proc: task_registry.attach_proc(sender, proc=proc),
         )
+        set_task_session(sender, None, project=proj, session_id=session_id, branch=task_branch)
         if res["success"]:
             await send_signal_message(sender, f"✅ Task Completed ({proj}):\n\n{res['summary']}")
         else:
             await send_signal_message(sender, f"❌ Task execution error: {res.get('error')}")
     except asyncio.CancelledError:
+        set_task_session(sender, None, project=proj, session_id=session_id, branch=task_branch)
         await send_signal_message(sender, f"🛑 Task Cancelled ({proj}, branch {task_branch})")
         raise
     finally:

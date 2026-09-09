@@ -219,6 +219,7 @@ class TelegramHandlerTestCase(unittest.TestCase):
         import handlers.custom_cmds as custom_cmds
         import handlers.git_ops as git_ops
         import handlers.interactive as interactive
+        import handlers.system as system
         import handlers.topics as topics
         import handlers.vault as vault
         self.core_config = core_config
@@ -228,6 +229,7 @@ class TelegramHandlerTestCase(unittest.TestCase):
         self.custom_cmds = custom_cmds
         self.git_ops = git_ops
         self.interactive = interactive
+        self.system = system
         self.topics = topics
         self.vault = vault
 
@@ -243,12 +245,18 @@ class TelegramHandlerTestCase(unittest.TestCase):
         # WORKSPACE and friends are `from core.config import ...`-ed into each
         # handler module at import time, so every consumer needs its own
         # binding repointed at the temp dirs.
-        for mod in (self.git_ops, self.topics, self.callbacks, self.ai_chat):
+        for mod in (self.git_ops, self.topics, self.callbacks, self.ai_chat, self.system):
             mod.WORKSPACE = self.workspace
         self.vault.OBSIDIAN_VAULT = self.obsidian
         self.topics.TOPICS_FILE = self.workspace / ".agent_topics.json"
         self.custom_cmds.CUSTOM_CMDS_FILE = self.workspace / ".custom_commands.json"
         self.custom_cmds.OBSIDIAN_CMDS_FILE = self.obsidian / "Config" / "commands.json"
+        # get_task_session/set_task_session (imported into handlers.system by
+        # name) close over core.task_sessions' own TASK_SESSIONS_FILE, not
+        # anything on the system module -- must be repointed at the module
+        # that actually owns it.
+        import core.task_sessions as task_sessions
+        task_sessions.TASK_SESSIONS_FILE = self.workspace / ".agent_task_sessions.json"
 
         self._patched = []
 
@@ -316,6 +324,22 @@ class TelegramHandlerTestCase(unittest.TestCase):
         )
         os.chmod(shim, 0o755)  # nosec B103
         self.patch(self.git_ops, "GIT_BIN", str(shim))
+        return log
+
+    def fake_aider_bin(self, exit_code=0):
+        """Installs a shim in place of the real aider binary that records
+        every argv it is called with, so tests can assert on exact aider CLI
+        flags (--yes-always, --restore-chat-history) without running real
+        aider (which isn't installed in this test environment anyway)."""
+        log = self.tmp / "aider-argv.log"
+        shim = self.tmp / "fakeaider.sh"
+        shim.write_text(
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$*" >> "{log}"\n'
+            f"exit {exit_code}\n"
+        )
+        os.chmod(shim, 0o755)  # nosec B103
+        self.patch(self.system, "AIDER_BIN", str(shim))
         return log
 
 
@@ -1132,6 +1156,173 @@ class TestTelegramMaintenance(TelegramHandlerTestCase):
         update, context = DummyUpdate(), DummyContext()
         self.arun(self.maintenance.update_cmd(update, context))
         self.assertTrue(any("Could not check for updates" in r for r in update.replies()))
+
+
+class TestTelegramTaskSessions(TelegramHandlerTestCase):
+    """core/task_sessions.py's get/set/clear roundtrip -- mirrors
+    topics.py's own binding-file test coverage."""
+
+    def setUp(self):
+        super().setUp()
+        import core.task_sessions as task_sessions
+        self.task_sessions = task_sessions
+        self.task_sessions.TASK_SESSIONS_FILE = self.workspace / ".agent_task_sessions.json"
+
+    def test_roundtrip_set_get_clear(self):
+        self.assertIsNone(self.task_sessions.get_task_session(1, 5))
+        self.task_sessions.set_task_session(1, 5, project="myproj", session_id="task_1", branch="agent/task_1")
+        self.assertEqual(
+            self.task_sessions.get_task_session(1, 5),
+            {"project": "myproj", "session_id": "task_1", "branch": "agent/task_1"},
+        )
+        self.task_sessions.clear_task_session(1, 5)
+        self.assertIsNone(self.task_sessions.get_task_session(1, 5))
+
+    def test_clear_unknown_session_is_a_noop(self):
+        self.task_sessions.clear_task_session(1, 5)  # should not raise
+
+    def test_load_tolerates_corrupt_file(self):
+        self.task_sessions.TASK_SESSIONS_FILE.write_text("{not json")
+        self.assertIsNone(self.task_sessions.get_task_session(1, 5))
+
+
+class TestTelegramTaskCmd(TelegramHandlerTestCase):
+    """/task: verified against the exact root cause found in aider's own
+    docs -- without --yes-always a single-shot `aider --message` run just
+    asks a question and exits without editing anything, and without
+    --restore-chat-history every /task call has zero memory of the last one.
+    See handlers/system.py's task_cmd/run_agent_task docstrings."""
+
+    # -- run_agent_task (called directly so the background work is awaited
+    # to completion, rather than raced via task_cmd's asyncio.create_task) --
+
+    def test_run_agent_task_fresh_branch_uses_yes_always_no_restore_history(self):
+        repo = self.make_repo("myproj")
+        log = self.fake_aider_bin()
+        status_msg = DummyStatusMessage()
+
+        self.arun(self.system.run_agent_task(
+            1, 5, status_msg, repo, "do the thing", "task_new", "agent/task_new", resume=False,
+        ))
+
+        argv = log.read_text()
+        self.assertIn("--yes-always", argv)
+        self.assertNotIn("--restore-chat-history", argv)
+        branch = self.git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        self.assertEqual(branch, "agent/task_new")
+
+    def test_run_agent_task_resume_uses_restore_history_and_plain_checkout(self):
+        repo = self.make_repo("myproj")
+        self.git(repo, "checkout", "-b", "agent/task_old")
+        self.git(repo, "checkout", "main")
+        log = self.fake_aider_bin()
+        status_msg = DummyStatusMessage()
+
+        self.arun(self.system.run_agent_task(
+            1, 5, status_msg, repo, "continue the work", "task_old", "agent/task_old", resume=True,
+        ))
+
+        argv = log.read_text()
+        self.assertIn("--restore-chat-history", argv)
+        branch = self.git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        self.assertEqual(branch, "agent/task_old")
+
+    def test_run_agent_task_records_session_on_success(self):
+        repo = self.make_repo("myproj")
+        self.fake_aider_bin()
+        status_msg = DummyStatusMessage()
+
+        self.arun(self.system.run_agent_task(
+            1, 5, status_msg, repo, "do the thing", "task_new", "agent/task_new", resume=False,
+        ))
+
+        self.assertEqual(
+            self.system.get_task_session(1, 5),
+            {"project": "myproj", "session_id": "task_new", "branch": "agent/task_new"},
+        )
+
+    # -- task_cmd (the dispatch/resume decision itself) ----------------------
+
+    def _run_task_cmd_and_await_background(self, update, context):
+        """task_cmd schedules its real work via asyncio.create_task and
+        returns immediately -- capture that task via a task_registry.start
+        wrapper and await it explicitly so the background run_agent_task
+        body actually completes before the test makes assertions."""
+        captured = {}
+        orig_start = self.system.task_registry.start
+
+        def capturing_start(chat_id, thread_id, label, asyncio_task):
+            captured["task"] = asyncio_task
+            return orig_start(chat_id, thread_id, label=label, asyncio_task=asyncio_task)
+
+        self.patch(self.system.task_registry, "start", capturing_start)
+
+        async def run():
+            await self.system.task_cmd(update, context)
+            await captured["task"]
+
+        self.arun(run())
+
+    def test_task_cmd_starts_fresh_when_no_existing_session(self):
+        self.make_repo("myproj")
+        self.fake_aider_bin()
+        update = DummyUpdate(thread_id=5)
+        context = DummyContext(args=["myproj", "do", "the", "thing"])
+
+        self._run_task_cmd_and_await_background(update, context)
+
+        self.assertTrue(any("Launching Autonomous Agent Task" in r for r in update.replies()))
+        self.assertFalse(any("Continuing Session" in r for r in update.replies()))
+        session = self.system.get_task_session(1, 5)
+        self.assertEqual(session["project"], "myproj")
+
+    def test_task_cmd_resumes_existing_session_for_same_project(self):
+        repo = self.make_repo("myproj")
+        self.git(repo, "checkout", "-b", "agent/task_old")
+        self.git(repo, "checkout", "main")
+        self.system.set_task_session(1, 5, project="myproj", session_id="task_old", branch="agent/task_old")
+        log = self.fake_aider_bin()
+        update = DummyUpdate(thread_id=5)
+        context = DummyContext(args=["myproj", "keep", "going"])
+
+        self._run_task_cmd_and_await_background(update, context)
+
+        self.assertTrue(any("Continuing Session" in r for r in update.replies()))
+        self.assertTrue(any("agent/task_old" in r for r in update.replies()))
+        self.assertIn("--restore-chat-history", log.read_text())
+        session = self.system.get_task_session(1, 5)
+        self.assertEqual(session["session_id"], "task_old")
+
+    def test_task_cmd_new_flag_abandons_existing_session(self):
+        repo = self.make_repo("myproj")
+        self.git(repo, "checkout", "-b", "agent/task_old")
+        self.git(repo, "checkout", "main")
+        self.system.set_task_session(1, 5, project="myproj", session_id="task_old", branch="agent/task_old")
+        log = self.fake_aider_bin()
+        update = DummyUpdate(thread_id=5)
+        context = DummyContext(args=["--new", "myproj", "start", "over"])
+
+        self._run_task_cmd_and_await_background(update, context)
+
+        self.assertTrue(any("Launching Autonomous Agent Task" in r for r in update.replies()))
+        self.assertNotIn("--restore-chat-history", log.read_text())
+        session = self.system.get_task_session(1, 5)
+        self.assertNotEqual(session["session_id"], "task_old")
+
+    def test_task_cmd_starts_fresh_when_stored_session_is_a_different_project(self):
+        self.make_repo("myproj")
+        self.make_repo("otherproj")
+        self.system.set_task_session(1, 5, project="otherproj", session_id="task_old", branch="agent/task_old")
+        log = self.fake_aider_bin()
+        update = DummyUpdate(thread_id=5)
+        context = DummyContext(args=["myproj", "do", "something", "else"])
+
+        self._run_task_cmd_and_await_background(update, context)
+
+        self.assertTrue(any("Launching Autonomous Agent Task" in r for r in update.replies()))
+        self.assertNotIn("--restore-chat-history", log.read_text())
+        session = self.system.get_task_session(1, 5)
+        self.assertEqual(session["project"], "myproj")
 
 
 class TestTelegramInteractive(TelegramHandlerTestCase):
