@@ -44,6 +44,9 @@ class FakeProc:
     async def communicate(self):
         return self._stdout, self._stderr
 
+    async def wait(self):
+        return self.returncode
+
 
 class TestTaskService(unittest.TestCase):
     def setUp(self):

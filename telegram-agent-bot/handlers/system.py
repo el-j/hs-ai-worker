@@ -332,7 +332,8 @@ async def run_agent_task(chat_id: int, thread_id: int | None, status_msg, projec
         is_git = (project_dir / ".git").exists()
         if is_git:
             checkout_args = ["checkout", task_branch] if resume else ["checkout", "-B", task_branch]
-            await asyncio.create_subprocess_exec(GIT_BIN, *checkout_args, cwd=str(project_dir))  # nosec B603,B607
+            checkout_proc = await asyncio.create_subprocess_exec(GIT_BIN, *checkout_args, cwd=str(project_dir))  # nosec B603,B607
+            await checkout_proc.wait()
 
         cmd = [
             AIDER_BIN,
